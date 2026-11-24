@@ -18,7 +18,30 @@ const total=document.getElementById('total'),tracked=document.getElementById('tr
 const won=n=>Number(n).toLocaleString('ko-KR')+'원';const headers=()=>({'Authorization':'Bearer '+token});
 async function api(path,opts={}){let r=await fetch(path,{...opts,headers:{...headers(),...(opts.headers||{})}});if(!r.ok)throw Error((await r.text())||r.status);return r.json()}
 function esc(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
-function saveToken(){token=document.getElementById('token').value.trim();localStorage.setItem('rpm_token',token);loadSummary();loadProducts()}
+async function saveToken(){
+  const candidate=document.getElementById('token').value.trim();
+  if(!candidate){investigationStatus.textContent='관리자 접속 토큰을 입력하세요.';return}
+  token=candidate;
+  const authButton=document.querySelector('button[onclick="saveToken()"]');
+  authButton.disabled=true;
+  investigationStatus.textContent='관리자 인증을 확인하고 있습니다…';
+  try{
+    const s=await api('/api/summary');
+    localStorage.setItem('rpm_token',token);
+    total.textContent=s.total_products.toLocaleString();
+    tracked.textContent=s.tracked_products.toLocaleString();
+    priced.textContent=s.products_with_prices.toLocaleString();
+    connection.textContent='서버 정상 · 0.4.1';
+    investigationStatus.textContent='관리자 인증 성공! 상품 목록 등록 및 가격 이력 관리가 가능합니다.';
+    await loadProducts();
+  }catch(e){
+    token='';
+    localStorage.removeItem('rpm_token');
+    investigationStatus.textContent='인증 실패: '+e.message+' · Render의 ADMIN_TOKEN과 입력값을 확인하세요.';
+  }finally{
+    authButton.disabled=false;
+  }
+}
 async function loadSummary(){try{let h=await fetch('/api/health').then(r=>r.json());connection.textContent='서버 정상 · '+h.version;let s=await api('/api/summary');total.textContent=s.total_products.toLocaleString();tracked.textContent=s.tracked_products.toLocaleString();priced.textContent=s.products_with_prices.toLocaleString()}catch(e){connection.textContent='인증 또는 서버 확인 필요'}}
 async function uploadXlsx(){let f=document.getElementById('xlsx').files[0];if(!f)return alert('최신 상품 엑셀 파일을 선택하세요.');let b=document.querySelector('button[onclick="uploadXlsx()"]');b.disabled=true;let fd=new FormData();fd.append('file',f);try{importStatus.textContent='상품 정보를 등록하고 있습니다…';let j=await api('/api/import-xlsx/start',{method:'POST',body:fd});while(true){await new Promise(r=>setTimeout(r,1000));let x=await api('/api/import-xlsx/status/'+j.job_id);if(x.status==='completed'){importStatus.textContent=`완료 · 신규 ${x.added.toLocaleString()}개 / 갱신 ${x.updated.toLocaleString()}개 / 실패 ${x.failed.toLocaleString()}개 / 총 ${x.total.toLocaleString()}개`;await loadSummary();await loadProducts();break}else if(x.status==='failed')throw Error(x.error);else importStatus.textContent=`처리 중 ${x.processed.toLocaleString()} / ${x.total.toLocaleString()} (${x.percent}%)`}}catch(e){importStatus.textContent='실패: '+e.message}finally{b.disabled=false}}
 async function uploadPrices(){let f=document.getElementById('priceCsv').files[0];if(!f)return alert('쿠팡 가격 CSV 파일을 선택하세요.');let fd=new FormData();fd.append('file',f);try{let x=await api('/api/import-prices-csv',{method:'POST',body:fd});priceStatus.textContent=`쿠팡 가격 ${x.imported.toLocaleString()}건 등록 · 알 수 없는 SKU ${x.unknown_sku_rows.toLocaleString()}행 · 쿠팡 외 판매처 제외 ${x.skipped_non_coupang_rows.toLocaleString()}행`;await loadSummary()}catch(e){priceStatus.textContent='실패: '+e.message}}

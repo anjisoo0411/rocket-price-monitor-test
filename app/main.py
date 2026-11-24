@@ -103,7 +103,7 @@ def migrate_product_columns():
                 conn.exec_driver_sql(f"ALTER TABLE products ADD COLUMN {name} {sql_type}")
 migrate_product_columns()
 
-app = FastAPI(title="Rocket Price Investigation", version="0.4.0")
+app = FastAPI(title="Rocket Price Investigation", version="0.4.1")
 app.mount("/static", StaticFiles(directory=str(BASE / "app" / "static")), name="static")
 
 def db():
@@ -137,7 +137,7 @@ def home(): return (BASE / "app" / "static" / "index.html").read_text(encoding="
 
 @app.get("/api/health")
 def health():
-    return {"status":"ok", "version":"0.4.0", "price_collection":"manual_authorized_data_only", "competitor_provider":"not_used"}
+    return {"status":"ok", "version":"0.4.1", "price_collection":"manual_authorized_data_only", "competitor_provider":"not_used"}
 
 @app.get("/api/summary", dependencies=[Depends(auth)])
 def summary(s: Session=Depends(db)):
