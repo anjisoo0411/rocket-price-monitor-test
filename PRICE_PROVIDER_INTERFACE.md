@@ -1,9 +1,9 @@
-# Price data provider boundary
+# Price provider – 0.4.2
 
-This release does not automate access to Coupang or Naver Shopping pages.
+Coupang price-change detection uses the official Open API endpoint `GET /v2/providers/seller_api/apis/api/v1/marketplace/vendor-items/{vendorItemId}/inventories` and stores `data.salePrice` as a consistent change-detection indicator. It is not represented as a verified consumer-facing Rocket Delivery price.
 
-Coupang snapshots are imported from an authorized data source or a manually verified CSV. Required CSV fields: `SKU ID`, `판매처`, `가격`; optional fields: `배송비`, `URL`, `판매자`. The current dashboard accepts rows whose source is exactly `쿠팡`.
+Required Render environment variables: `COUPANG_ACCESS_KEY`, `COUPANG_SECRET_KEY`, `COUPANG_VENDOR_ID`. Keys must be newly issued/rotated by the user and must never be entered into chat or committed to source control.
 
-The investigation endpoint compares the latest two saved Coupang snapshots per SKU and generates Naver Shopping search links only for changed SKUs. A person confirms that the result is the same own-brand product. The system does not claim causation based on a single price observation.
+The dashboard first offers a single-item API test, then a five-item test collection, then full on-demand collection. Full collection is sequential and throttled to at most about 3 requests/second (minimum 0.34 seconds between calls). HTTP 401/403/429 immediately stops the job. Each successful result is stored as a Coupang snapshot. Price comparison continues to compare the latest two snapshots per SKU.
 
-Do not add browser automation, scraping, anti-bot workarounds, or authenticated page extraction unless the platform has expressly authorized the access or an approved data provider is used. WING seller API `salePrice` must not be treated as Rocket Delivery consumer-facing price without independent validation.
+Naver Shopping remains a human-opened search link; no automated scraping is implemented.
