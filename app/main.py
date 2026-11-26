@@ -180,7 +180,7 @@ def home(): return (BASE / "app" / "static" / "index.html").read_text(encoding="
 
 @app.get("/api/health")
 def health():
-    return {"status":"ok", "version":"0.5.1", "price_collection":"manual_dated_batch_upload", "competitor_provider":"manual_naver_search"}
+    return {"status":"ok", "version":"0.6.0", "price_collection":"manual_dated_batch_upload", "competitor_provider":"manual_naver_search"}
 
 @app.get("/api/summary", dependencies=[Depends(auth)])
 def summary(s: Session=Depends(db)):
@@ -364,10 +364,15 @@ def compare_crawl_batches(previous_id: int, current_id: int, s: Session=Depends(
     a={x.option_id:x for x in s.query(CrawlRow).filter_by(batch_id=old.id).all()}; b={x.option_id:x for x in s.query(CrawlRow).filter_by(batch_id=new.id).all()}
     ids=set(a)&set(b); products={}
     for p in s.query(Product).filter(Product.option_id.in_(ids)).all(): products.setdefault(p.option_id,[]).append(p)
-    out=[]; missing_master=0
+    out=[]; missing_master=0; price_changed_count=0; inventory_changed_count=0
     for oid in ids:
         x,y=a[oid],b[oid]
-        if x.price==y.price and x.sold_out==y.sold_out and x.stock==y.stock: continue
+        change_types=[]
+        if x.price != y.price: change_types.append("price"); price_changed_count += 1
+        if x.stock != y.stock: change_types.append("stock")
+        if x.sold_out != y.sold_out: change_types.append("sold_out")
+        if "stock" in change_types or "sold_out" in change_types: inventory_changed_count += 1
+        if not change_types: continue
         matched=products.get(oid,[])
         if not matched: missing_master+=1
         p=matched[0] if len(matched)==1 else None
@@ -377,12 +382,14 @@ def compare_crawl_batches(previous_id: int, current_id: int, s: Session=Depends(
         out.append({"option_id":oid,"sku_id":p.sku_id if p else None,"name":name,"crawl_name":y.name,"barcode":p.barcode if p else None,
           "previous_price":x.price,"current_price":y.price,"delta":y.price-x.price,"previous_stock":x.stock,"current_stock":y.stock,
           "previous_sold_out":x.sold_out,"current_sold_out":y.sold_out,"previous_date":old.crawl_date,"current_date":new.crawl_date,
+          "change_types":change_types,
           "coupang_url":url,"naver_search_url":"https://search.shopping.naver.com/search/all?query="+urllib.parse.quote((p.barcode+" "+name).strip() if p and p.barcode else name),
           "match_evidence":("마스터 옵션ID 일치" if p else "마스터에서 옵션ID를 찾지 못함; 크롤링 상품명으로 표시"),
           "candidates":[{"id":c.id,"product_name":c.product_name,"price":c.price,"seller":c.seller,"url":c.url,"evidence":c.evidence} for c in candidate_rows]})
     out.sort(key=lambda v:abs(v["delta"]),reverse=True)
     return {"previous":{"id":old.id,"date":old.crawl_date,"row_count":old.row_count},"current":{"id":new.id,"date":new.crawl_date,"row_count":new.row_count},
-      "compared_count":len(ids),"changed_count":len(out),"previous_only_count":len(set(a)-set(b)),"current_only_count":len(set(b)-set(a)),
+      "compared_count":len(ids),"changed_count":len(out),"price_changed_count":price_changed_count,"inventory_changed_count":inventory_changed_count,
+      "previous_only_count":len(set(a)-set(b)),"current_only_count":len(set(b)-set(a)),
       "unmatched_master_changes":missing_master,"items":out,"note":"가격/재고/품절 변동의 동시 발생은 원인 확정이 아닙니다. 네이버 후보는 참고 자료이며 직접 검토해 주세요."}
 
 @app.post("/api/naver-candidates", dependencies=[Depends(auth)])

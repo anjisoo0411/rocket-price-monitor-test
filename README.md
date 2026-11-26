@@ -1,4 +1,4 @@
-# Rocket Price Monitor 0.5.1
+# Rocket Price Monitor 0.6.0
 
 Manual investigation tool for comparing daily Coupang crawl exports and reviewing possible Naver Shopping candidates.
 
@@ -6,7 +6,7 @@ Manual investigation tool for comparing daily Coupang crawl exports and reviewin
 
 1. Sign in with the administrator token.
 2. Upload each raw `.xlsx` or `.csv` crawl export. The date is read from a filename containing `YYYYMMDD`, or can be supplied in the form.
-3. Select two saved batches and compare them. Only options with a changed price, stock quantity, or sold-out state are shown.
+3. Select two saved batches and compare them. The results show separate counts for price changes and inventory/sold-out changes. Filter to price changes, inventory/sold-out changes, or all changes, then search by SKU, product name, barcode, or option ID.
 4. Open the Naver Shopping search link for a changed product. Review results manually and optionally save candidate product name, price, seller, URL, and evidence.
 
 Candidate products are possible context only; the application never labels them as proven causes. It does not scrape Naver or assume the retired Naver Shopping Search API is available.
