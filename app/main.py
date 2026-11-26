@@ -1,6 +1,7 @@
 from datetime import datetime, timezone
 from pathlib import Path
-import csv, io, os, secrets, urllib.parse, json, re
+import csv, io, os, secrets, urllib.parse, json, re, logging
+from itertools import chain, islice
 from typing import Optional
 
 from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Header, Form, BackgroundTasks
@@ -23,6 +24,7 @@ class Settings(BaseSettings):
         extra = "ignore"
 
 settings = Settings()
+logger = logging.getLogger("rocket_price_monitor")
 if settings.database_url.startswith("postgres://"):
     settings.database_url = settings.database_url.replace("postgres://", "postgresql+psycopg://", 1)
 elif settings.database_url.startswith("postgresql://"):
@@ -77,6 +79,17 @@ class ImportJob(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
 
+class SellerImportJob(Base):
+    __tablename__ = "seller_import_jobs"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    source: Mapped[str] = mapped_column(String(100))
+    source_filename: Mapped[str] = mapped_column(String(300))
+    status: Mapped[str] = mapped_column(String(20), default="queued")
+    processed: Mapped[int] = mapped_column(Integer, default=0)
+    error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
+
 class CrawlBatch(Base):
     __tablename__ = "crawl_batches"
     __table_args__ = (UniqueConstraint("crawl_date", name="uq_crawl_batch_date"),)
@@ -122,6 +135,7 @@ class SellerOfferBatch(Base):
     source: Mapped[str] = mapped_column(String(100), index=True)
     source_filename: Mapped[str] = mapped_column(String(300))
     row_count: Mapped[int] = mapped_column(Integer, default=0)
+    status: Mapped[str] = mapped_column(String(20), default="completed", index=True)
     imported_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc), index=True)
 
 class SellerOffer(Base):
@@ -161,9 +175,13 @@ def migrate_product_columns():
         for name, sql_type in additions.items():
             if name not in existing:
                 conn.exec_driver_sql(f"ALTER TABLE products ADD COLUMN {name} {sql_type}")
+    batch_columns = {c["name"] for c in inspect(engine).get_columns("seller_offer_batches")}
+    if "status" not in batch_columns:
+        with engine.begin() as conn:
+            conn.exec_driver_sql("ALTER TABLE seller_offer_batches ADD COLUMN status VARCHAR(20) NOT NULL DEFAULT 'completed'")
 migrate_product_columns()
 
-app = FastAPI(title="Rocket Price Investigation", version="0.7.0")
+app = FastAPI(title="Rocket Price Investigation", version="0.7.1")
 app.mount("/static", StaticFiles(directory=str(BASE / "app" / "static")), name="static")
 
 def db():
@@ -202,7 +220,7 @@ def home(): return (BASE / "app" / "static" / "index.html").read_text(encoding="
 
 @app.get("/api/health")
 def health():
-    return {"status":"ok", "version":"0.7.0", "price_collection":"manual_dated_batch_upload", "seller_price_source":"authorized_seller_center_exports"}
+    return {"status":"ok", "version":"0.7.1", "price_collection":"manual_dated_batch_upload", "seller_price_source":"authorized_seller_center_exports"}
 
 @app.get("/api/summary", dependencies=[Depends(auth)])
 def summary(s: Session=Depends(db)):
@@ -360,21 +378,20 @@ def _read_crawl_file(filename: str, raw: bytes):
     if not result: raise HTTPException(400, "가져올 데이터 행이 없습니다.")
     return result
 
-def _read_seller_export(filename: str, raw: bytes):
-    """Read a seller-center product list export. No seller-site crawling is performed."""
+def _iter_seller_export(filename: str, raw: bytes):
+    """Yield normalized seller rows without materializing the full CSV matrix."""
+    wb = None
+    csv_stream = None
     if filename.lower().endswith((".xlsx", ".xlsm")):
         wb = load_workbook(io.BytesIO(raw), read_only=True, data_only=True)
-        try:
-            ws = wb.active
-            matrix = list(ws.iter_rows(values_only=True))
-        finally:
-            wb.close()
+        iterator = wb.active.iter_rows(values_only=True)
     elif filename.lower().endswith(".csv"):
         try:
             content = raw.decode("utf-8-sig")
         except UnicodeDecodeError:
             content = raw.decode("cp949")
-        matrix = list(csv.reader(io.StringIO(content)))
+        csv_stream = io.StringIO(content, newline="")
+        iterator = csv.reader(csv_stream)
     else:
         raise HTTPException(400, ".xlsx 또는 .csv 판매자센터 내보내기 파일을 선택해 주세요.")
     aliases = {
@@ -390,12 +407,15 @@ def _read_seller_export(filename: str, raw: bytes):
         return re.sub(r"[\s_()（）\-]+", "", str(v or "").strip()).lower()
     normalized_aliases = {key:{normalized(v) for v in values} for key,values in aliases.items()}
     header_row = None; indexes = None
-    for row_no, row in enumerate(matrix[:30]):
+    prefix = list(islice(iterator, 30))
+    for row_no, row in enumerate(prefix):
         names = [normalized(v) for v in row]
         found = {key: next((i for i,v in enumerate(names) if v in vals), None) for key,vals in normalized_aliases.items()}
         if found["name"] is not None and found["price"] is not None:
             header_row = row_no; indexes = found; break
     if indexes is None:
+        if wb: wb.close()
+        if csv_stream: csv_stream.close()
         raise HTTPException(400, "판매자센터 파일에서 상품명과 판매가 열을 찾지 못했습니다. 내보낸 원본 파일을 선택해 주세요.")
     def cell(row, key):
         i = indexes.get(key)
@@ -404,28 +424,35 @@ def _read_seller_export(filename: str, raw: bytes):
         if v in (None, ""): return None
         if isinstance(v, (int,float)) and float(v).is_integer(): return str(int(v))
         return str(v).strip()
-    result=[]; seen=set()
-    for row_no, row in enumerate(matrix[header_row+1:], start=header_row+1):
-        name = clean(cell(row,"name"))
-        if not name: continue
-        raw_price = cell(row,"price")
-        try: price = int(float(str(raw_price).replace(",","").replace("원","").strip()))
-        except (TypeError, ValueError):
-            # Ignore summary/header lines, but reject actual named products with invalid prices.
-            raise HTTPException(400, f"판매가 숫자 형식을 확인해 주세요: {name[:80]}")
-        if price <= 0: continue
-        product_id=clean(cell(row,"product_id")); code=clean(cell(row,"seller_code")); barcode=clean(cell(row,"barcode"))
-        # SmartStore exports commonly place the barcode in seller product code.
-        if not barcode and code and re.fullmatch(r"\d{8,14}", code): barcode=code
-        url=clean(cell(row,"url"))
-        if url and not url.startswith(("https://","http://")): url=None
-        key=product_id or code or f"{normalized(name)}|{price}"
-        if key in seen: key=f"{key}|{row_no}"
-        seen.add(key)
-        result.append({"source_product_id":key,"seller_code":code,"barcode":barcode,"product_name":name,"price":price,
-                       "seller":clean(cell(row,"seller")),"url":url})
-    if not result: raise HTTPException(400, "판매자센터 파일에 가져올 상품 행이 없습니다.")
-    return result
+    def generate():
+        seen=set(); count=0
+        try:
+            for row_no, row in enumerate(chain(prefix[header_row+1:], iterator), start=header_row+1):
+                name = clean(cell(row,"name"))
+                if not name: continue
+                raw_price = cell(row,"price")
+                try: price = int(float(str(raw_price).replace(",","").replace("원","").strip()))
+                except (TypeError, ValueError):
+                    raise HTTPException(400, f"판매가 숫자 형식을 확인해 주세요: {name[:80]}")
+                if price <= 0: continue
+                product_id=clean(cell(row,"product_id")); code=clean(cell(row,"seller_code")); barcode=clean(cell(row,"barcode"))
+                if not barcode and code and re.fullmatch(r"\d{8,14}", code): barcode=code
+                url=clean(cell(row,"url"))
+                if url and not url.startswith(("https://","http://")): url=None
+                key=product_id or code or f"{normalized(name)}|{price}"
+                if key in seen: key=f"{key}|{row_no}"
+                seen.add(key); count += 1
+                yield {"source_product_id":key,"seller_code":code,"barcode":barcode,"product_name":name,"price":price,
+                       "seller":clean(cell(row,"seller")),"url":url}
+            if not count: raise HTTPException(400, "판매자센터 파일에 가져올 상품 행이 없습니다.")
+        finally:
+            if wb: wb.close()
+            if csv_stream: csv_stream.close()
+    return generate()
+
+def _read_seller_export(filename: str, raw: bytes):
+    """Compatibility helper for small test inputs; the production import streams rows."""
+    return list(_iter_seller_export(filename, raw))
 
 def _name_tokens(value):
     tokens = re.findall(r"[0-9a-z가-힣]+", (value or "").lower())
@@ -457,20 +484,73 @@ def _seller_offer_matches(offers, product: Optional[Product], crawl_name: str, c
         if len(by_source[row["source"]])<3: by_source[row["source"]].append(row)
     return [row for source_rows in by_source.values() for row in source_rows]
 
-@app.post("/api/seller-batches", dependencies=[Depends(auth)])
-async def upload_seller_batch(source: str=Form(...), file: UploadFile=File(...), s: Session=Depends(db)):
-    source=source.strip()
+def _run_seller_import(job_id: int, source: str, filename: str, raw: bytes):
+    """Parse and insert rows in bounded chunks outside the browser request lifetime."""
+    s = SessionLocal(); batch = None
+    try:
+        logger.info("seller_import_started job_id=%s source=%s filename=%s bytes=%s",job_id,source,filename,len(raw))
+        job = s.get(SellerImportJob, job_id)
+        if not job: return
+        job.status = "processing"; job.updated_at = datetime.now(timezone.utc); s.commit()
+        batch = SellerOfferBatch(source=source, source_filename=filename[:300], row_count=0, status="processing")
+        s.add(batch); s.commit(); s.refresh(batch)
+        chunk=[]; processed=0
+        for row in _iter_seller_export(filename, raw):
+            chunk.append(dict(batch_id=batch.id, **row))
+            if len(chunk) >= 500:
+                s.execute(insert(SellerOffer), chunk)
+                processed += len(chunk); chunk=[]
+                batch.row_count=processed
+                job=s.get(SellerImportJob,job_id); job.processed=processed; job.updated_at=datetime.now(timezone.utc)
+                s.commit()
+                logger.info("seller_import_progress job_id=%s processed=%s",job_id,processed)
+        if chunk:
+            s.execute(insert(SellerOffer), chunk)
+            processed += len(chunk)
+        if processed < 1:
+            raise HTTPException(400, "판매자센터 파일에 가져올 상품 행이 없습니다.")
+        batch.row_count=processed; batch.status="completed"
+        job=s.get(SellerImportJob,job_id); job.processed=processed; job.status="completed"; job.updated_at=datetime.now(timezone.utc)
+        s.commit()
+        logger.info("seller_import_completed job_id=%s rows=%s",job_id,processed)
+    except Exception as exc:
+        s.rollback()
+        job=s.get(SellerImportJob,job_id)
+        if job:
+            job.status="failed"
+            job.error=(str(exc.detail) if isinstance(exc,HTTPException) else str(exc))[:1000]
+            job.updated_at=datetime.now(timezone.utc)
+        if batch:
+            batch=s.get(SellerOfferBatch,batch.id)
+            if batch: batch.status="failed"
+        s.commit()
+        logger.exception("seller_import_failed job_id=%s",job_id)
+    finally:
+        s.close()
+
+@app.post("/api/seller-batches", status_code=202, dependencies=[Depends(auth)])
+async def upload_seller_batch(background_tasks: BackgroundTasks, source: str=Form(...), file: UploadFile=File(...), s: Session=Depends(db)):
+    source=source.strip(); filename=file.filename or "upload"
     if not source or len(source)>100: raise HTTPException(400,"판매처 이름을 입력해 주세요.")
-    rows=_read_seller_export(file.filename or "upload", await file.read())
-    batch=SellerOfferBatch(source=source,source_filename=(file.filename or "upload")[:300],row_count=len(rows)); s.add(batch); s.flush()
-    for start in range(0,len(rows),1000):
-        s.execute(insert(SellerOffer),[dict(batch_id=batch.id,**row) for row in rows[start:start+1000]])
-    s.commit()
-    return {"batch_id":batch.id,"source":source,"row_count":len(rows),"status":"completed"}
+    if not filename.lower().endswith((".csv", ".xlsx", ".xlsm")):
+        raise HTTPException(400,".xlsx 또는 .csv 판매자센터 파일을 선택해 주세요.")
+    raw=await file.read()
+    job=SellerImportJob(source=source,source_filename=filename[:300],status="queued")
+    s.add(job); s.commit(); s.refresh(job)
+    background_tasks.add_task(_run_seller_import,job.id,source,filename,raw)
+    logger.info("seller_upload_accepted job_id=%s source=%s filename=%s bytes=%s",job.id,source,filename,len(raw))
+    return {"job_id":job.id,"source":source,"status":"queued"}
+
+@app.get("/api/seller-batches/status/{job_id}", dependencies=[Depends(auth)])
+def seller_import_status(job_id: int, s: Session=Depends(db)):
+    job=s.get(SellerImportJob,job_id)
+    if not job: raise HTTPException(404,"판매처 가격표 업로드 작업을 찾을 수 없습니다.")
+    return {"job_id":job.id,"source":job.source,"filename":job.source_filename,"status":job.status,
+            "processed":job.processed,"error":job.error}
 
 @app.get("/api/seller-batches", dependencies=[Depends(auth)])
 def list_seller_batches(s: Session=Depends(db)):
-    latest=s.query(func.max(SellerOfferBatch.id).label("id")).group_by(SellerOfferBatch.source).subquery()
+    latest=s.query(func.max(SellerOfferBatch.id).label("id")).filter(SellerOfferBatch.status=="completed").group_by(SellerOfferBatch.source).subquery()
     rows=s.query(SellerOfferBatch).join(latest,SellerOfferBatch.id==latest.c.id).order_by(SellerOfferBatch.source).all()
     return [{"id":b.id,"source":b.source,"source_filename":b.source_filename,"row_count":b.row_count,"imported_at":b.imported_at} for b in rows]
 
@@ -499,7 +579,7 @@ def compare_crawl_batches(previous_id: int, current_id: int, s: Session=Depends(
     if not old or not new or old.id==new.id: raise HTTPException(400,"서로 다른 두 날짜의 배치를 선택해 주세요.")
     a={x.option_id:x for x in s.query(CrawlRow).filter_by(batch_id=old.id).all()}; b={x.option_id:x for x in s.query(CrawlRow).filter_by(batch_id=new.id).all()}
     ids=set(a)&set(b); products={}
-    latest_offer_ids=s.query(func.max(SellerOfferBatch.id).label("id")).group_by(SellerOfferBatch.source).subquery()
+    latest_offer_ids=s.query(func.max(SellerOfferBatch.id).label("id")).filter(SellerOfferBatch.status=="completed").group_by(SellerOfferBatch.source).subquery()
     offer_rows=s.query(SellerOffer,SellerOfferBatch.source).join(SellerOfferBatch,SellerOfferBatch.id==SellerOffer.batch_id).join(latest_offer_ids,SellerOfferBatch.id==latest_offer_ids.c.id).all()
     for p in s.query(Product).filter(Product.option_id.in_(ids)).all(): products.setdefault(p.option_id,[]).append(p)
     out=[]; missing_master=0; price_changed_count=0; inventory_changed_count=0
