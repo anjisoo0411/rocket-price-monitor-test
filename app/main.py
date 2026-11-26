@@ -1,14 +1,14 @@
 from datetime import datetime, timezone
 from pathlib import Path
-import csv, io, os, secrets, urllib.parse, hmac, hashlib, time, json, urllib.request, urllib.error
+import csv, io, os, secrets, urllib.parse, json, re
 from typing import Optional
 
-from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Header, BackgroundTasks
+from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Header, Form, BackgroundTasks
 from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings
-from sqlalchemy import create_engine, String, Integer, Float, DateTime, ForeignKey, Text, func, or_
+from sqlalchemy import create_engine, String, Integer, Float, DateTime, ForeignKey, Text, func, or_, UniqueConstraint
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship, sessionmaker, Session
 from openpyxl import load_workbook
 
@@ -18,10 +18,6 @@ class Settings(BaseSettings):
     app_secret: str = "dev-only-change-me"
     admin_token: str = "dev-admin-token"
     database_url: str = "sqlite:///./data/rocket_prices.db"
-    coupang_access_key: str = ""
-    coupang_secret_key: str = ""
-    coupang_vendor_id: str = ""
-    coupang_request_interval: float = 0.34
     class Config:
         env_file = ".env"
         extra = "ignore"
@@ -81,17 +77,43 @@ class ImportJob(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
 
-class CoupangCollectionJob(Base):
-    __tablename__ = "coupang_collection_jobs"
+class CrawlBatch(Base):
+    __tablename__ = "crawl_batches"
+    __table_args__ = (UniqueConstraint("crawl_date", name="uq_crawl_batch_date"),)
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    status: Mapped[str] = mapped_column(String(20), default="queued")
-    total: Mapped[int] = mapped_column(Integer, default=0)
-    processed: Mapped[int] = mapped_column(Integer, default=0)
-    succeeded: Mapped[int] = mapped_column(Integer, default=0)
-    failed: Mapped[int] = mapped_column(Integer, default=0)
-    error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
-    updated_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
+    crawl_date: Mapped[str] = mapped_column(String(10), index=True)
+    source_filename: Mapped[str] = mapped_column(String(300))
+    row_count: Mapped[int] = mapped_column(Integer, default=0)
+    imported_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+class CrawlRow(Base):
+    __tablename__ = "crawl_rows"
+    __table_args__ = (UniqueConstraint("batch_id", "option_id", name="uq_crawl_option_per_batch"),)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    batch_id: Mapped[int] = mapped_column(ForeignKey("crawl_batches.id", ondelete="CASCADE"), index=True)
+    option_id: Mapped[str] = mapped_column(String(40), index=True)
+    exposure_id: Mapped[str] = mapped_column(String(40))
+    item_id: Mapped[str] = mapped_column(String(40))
+    price: Mapped[int] = mapped_column(Integer)
+    stock: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    name: Mapped[str] = mapped_column(String(700))
+    sold_out: Mapped[Optional[bool]] = mapped_column(nullable=True)
+    rating: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    review_count: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    seller_id: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    category_id: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+
+class NaverCandidate(Base):
+    __tablename__ = "naver_candidates"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    batch_id: Mapped[int] = mapped_column(ForeignKey("crawl_batches.id"), index=True)
+    option_id: Mapped[str] = mapped_column(String(40), index=True)
+    product_name: Mapped[str] = mapped_column(String(700))
+    price: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    seller: Mapped[Optional[str]] = mapped_column(String(250), nullable=True)
+    url: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    evidence: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    reviewed_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
 
 class AlertEvent(Base):
     __tablename__ = "alert_events"
@@ -135,88 +157,6 @@ def auth(authorization: Optional[str] = Header(default=None)):
     token = authorization.removeprefix("Bearer ") if authorization else ""
     if not secrets.compare_digest(token, expected): raise HTTPException(401, "인증 토큰이 올바르지 않습니다.")
 
-# Coupang official Open API: item inventory/price/status query.
-COUPANG_API_HOST = "https://api-gateway.coupang.com"
-COUPANG_INVENTORY_PATH = "/v2/providers/seller_api/apis/api/v1/marketplace/vendor-items/{vendor_item_id}/inventories"
-
-def _coupang_request(vendor_item_id: str):
-    if not (settings.coupang_access_key and settings.coupang_secret_key and settings.coupang_vendor_id):
-        raise RuntimeError("쿠팡 API 환경변수(COUPANG_ACCESS_KEY, COUPANG_SECRET_KEY, COUPANG_VENDOR_ID)가 설정되지 않았습니다.")
-    path = COUPANG_INVENTORY_PATH.format(vendor_item_id=urllib.parse.quote(str(vendor_item_id), safe=""))
-    method = "GET"
-    signed_date = datetime.now(timezone.utc).strftime("%y%m%dT%H%M%SZ")
-    message = signed_date + method + path
-    signature = hmac.new(settings.coupang_secret_key.encode("utf-8"), message.encode("utf-8"), hashlib.sha256).hexdigest()
-    authorization = ("CEA algorithm=HmacSHA256, access-key=" + settings.coupang_access_key +
-                    ", signed-date=" + signed_date + ", signature=" + signature)
-    req = urllib.request.Request(COUPANG_API_HOST + path, method=method, headers={
-        "Authorization": authorization,
-        "X-Requested-By": settings.coupang_vendor_id,
-        "X-MARKET": "KR",
-        "Content-Type": "application/json;charset=UTF-8",
-        "Accept": "application/json",
-    })
-    try:
-        with urllib.request.urlopen(req, timeout=20) as response:
-            payload = json.loads(response.read().decode("utf-8"))
-            if payload.get("code") != "SUCCESS" or not isinstance(payload.get("data"), dict):
-                raise RuntimeError(str(payload.get("message") or payload.get("code") or "쿠팡 API 응답 형식 오류")[:300])
-            data = payload["data"]
-            price = int(data.get("salePrice") or 0)
-            if price <= 0:
-                raise RuntimeError("쿠팡 API 응답에 유효한 salePrice가 없습니다.")
-            return {"price": price, "on_sale": data.get("onSale"), "stock": data.get("amountInStock")}
-    except urllib.error.HTTPError as e:
-        detail = e.read().decode("utf-8", "replace")[:400]
-        if e.code in (401, 403, 429):
-            raise RuntimeError(f"쿠팡 API HTTP {e.code}: {detail or e.reason}")
-        raise RuntimeError(f"쿠팡 API HTTP {e.code}: {detail or e.reason}")
-    except urllib.error.URLError as e:
-        raise RuntimeError(f"쿠팡 API 연결 오류: {e.reason}")
-
-def _run_coupang_collection(job_id: int, max_items: Optional[int] = None):
-    dbs = SessionLocal()
-    try:
-        job = dbs.get(CoupangCollectionJob, job_id)
-        if not job: return
-        job.status = "processing"; job.updated_at = datetime.now(timezone.utc); dbs.commit()
-        query = dbs.query(Product).filter(Product.tracking.is_(True), Product.option_id.isnot(None), Product.option_id != "").order_by(Product.sku_id)
-        if max_items: query = query.limit(max_items)
-        products = query.all()
-        job.total = len(products); job.updated_at = datetime.now(timezone.utc); dbs.commit()
-        if not products:
-            job.status = "failed"; job.error = "조회할 옵션 ID가 등록된 추적 상품이 없습니다."; dbs.commit(); return
-        interval = max(0.34, min(float(settings.coupang_request_interval or 0.34), 1.0))
-        for idx, p in enumerate(products, start=1):
-            try:
-                result = _coupang_request(p.option_id)
-                dbs.add(PriceSnapshot(product_id=p.id, source="쿠팡", price=result["price"], shipping=0,
-                                      url=p.coupang_url, seller="쿠팡 Open API", match_method="coupang_open_api_salePrice"))
-                job.succeeded += 1
-            except Exception as e:
-                job.failed += 1
-                msg = str(e)
-                # Stop immediately for credentials, access blocks, or throttling; do not hammer the API.
-                if any(code in msg for code in ("HTTP 401", "HTTP 403", "HTTP 429")):
-                    job.error = msg[:900]
-                    job.processed = idx - 1
-                    job.status = "failed"
-                    job.updated_at = datetime.now(timezone.utc)
-                    dbs.commit()
-                    return
-            job.processed = idx; job.updated_at = datetime.now(timezone.utc)
-            if idx % 10 == 0 or idx == len(products): dbs.commit()
-            else: dbs.flush()
-            if idx < len(products): time.sleep(interval)
-        job.status = "completed"; job.updated_at = datetime.now(timezone.utc); dbs.commit()
-    except Exception as e:
-        dbs.rollback()
-        job = dbs.get(CoupangCollectionJob, job_id)
-        if job:
-            job.status = "failed"; job.error = str(e)[:900]; job.updated_at = datetime.now(timezone.utc); dbs.commit()
-    finally:
-        dbs.close()
-
 class PriceIn(BaseModel):
     sku_id: str
     source: str = Field(min_length=1, max_length=80)
@@ -226,12 +166,21 @@ class PriceIn(BaseModel):
     seller: Optional[str] = None
     match_method: str = "manual"
 
+class CandidateIn(BaseModel):
+    batch_id: int
+    option_id: str
+    product_name: str = Field(min_length=1, max_length=700)
+    price: Optional[int] = Field(default=None, gt=0)
+    seller: Optional[str] = Field(default=None, max_length=250)
+    url: Optional[str] = None
+    evidence: Optional[str] = None
+
 @app.get("/", response_class=HTMLResponse)
 def home(): return (BASE / "app" / "static" / "index.html").read_text(encoding="utf-8")
 
 @app.get("/api/health")
 def health():
-    return {"status":"ok", "version":"0.4.2", "price_collection":"coupang_open_api_on_demand", "coupang_api_configured":bool(settings.coupang_access_key and settings.coupang_secret_key and settings.coupang_vendor_id), "competitor_provider":"not_used"}
+    return {"status":"ok", "version":"0.5.0", "price_collection":"manual_dated_batch_upload", "competitor_provider":"manual_naver_search"}
 
 @app.get("/api/summary", dependencies=[Depends(auth)])
 def summary(s: Session=Depends(db)):
@@ -337,6 +286,108 @@ def import_xlsx_status(job_id:int, s:Session=Depends(db)):
     percent=100 if job.status=="completed" else (round(job.processed/total*100) if total else 0)
     return {"job_id":job.id,"status":job.status,"total":total,"processed":job.processed,"percent":percent,"added":job.added,"updated":job.updated,"failed":job.failed,"error":job.error}
 
+def _norm_header(value):
+    return re.sub(r"[\s_]+", "", str(value or "").strip()).lower()
+
+def _crawl_date(filename: str, supplied: Optional[str]):
+    value = supplied or ""
+    if not value:
+        m = re.search(r"(20\d{2})[-_]?([01]\d)[-_]?([0-3]\d)", filename)
+        if m: value = f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
+    try: return datetime.strptime(value, "%Y-%m-%d").date().isoformat()
+    except ValueError: raise HTTPException(400, "수집일을 YYYY-MM-DD로 지정하거나 파일명에 YYYYMMDD 날짜를 넣어 주세요.")
+
+def _read_crawl_file(filename: str, raw: bytes):
+    required = {"옵션id", "노출id", "아이템id", "판매가", "상품명"}
+    if filename.lower().endswith((".xlsx", ".xlsm")):
+        wb = load_workbook(io.BytesIO(raw), read_only=True, data_only=True)
+        try:
+            ws = wb.active; iterator = ws.iter_rows(values_only=True)
+            headers = [_norm_header(x) for x in next(iterator, ())]
+            records = [dict(zip(headers, row)) for row in iterator]
+        finally: wb.close()
+    elif filename.lower().endswith(".csv"):
+        text = raw.decode("utf-8-sig")
+        reader = csv.DictReader(io.StringIO(text))
+        headers = [_norm_header(x) for x in (reader.fieldnames or [])]
+        records = [dict(zip(headers, row.values())) for row in reader]
+    else: raise HTTPException(400, ".xlsx 또는 .csv 파일을 업로드해 주세요.")
+    if not required.issubset(set(headers)):
+        raise HTTPException(400, "필수 컬럼(옵션ID, 노출ID, 아이템ID, 판매가, 상품명)이 없습니다.")
+    def value(row, key): return row.get(_norm_header(key))
+    def integer(x, label, required=True):
+        try:
+            if x in (None, "") and not required: return None
+            return int(float(str(x).replace(",", "").replace("원", "").strip()))
+        except (ValueError, TypeError): raise HTTPException(400, f"{label} 숫자 형식을 확인해 주세요.")
+    result=[]; seen=set()
+    for row in records:
+        option=str(value(row,"옵션ID") or "").strip()
+        if not option: continue
+        if option in seen: raise HTTPException(400, f"중복 옵션ID가 있습니다: {option}")
+        seen.add(option)
+        sold = str(value(row,"품절 여부") or "").strip().lower()
+        result.append({"option_id":option,"exposure_id":str(value(row,"노출ID") or "").strip(),
+          "item_id":str(value(row,"아이템ID") or "").strip(),"price":integer(value(row,"판매가"),"판매가"),
+          "stock":integer(value(row,"재고량"),"재고량",False),"name":str(value(row,"상품명") or "").strip(),
+          "sold_out": True if sold in ("yes","y","true","1","품절") else (False if sold in ("no","n","false","0","판매중") else None),
+          "rating":float(value(row,"평점")) if value(row,"평점") not in (None,"") else None,
+          "review_count":integer(value(row,"리뷰개수"),"리뷰개수",False),
+          "seller_id":str(value(row,"판매자 ID") or "").strip() or None,
+          "category_id":str(value(row,"카테고리 ID") or "").strip() or None})
+    if not result: raise HTTPException(400, "가져올 데이터 행이 없습니다.")
+    return result
+
+@app.post("/api/crawl-batches", dependencies=[Depends(auth)])
+async def upload_crawl_batch(file: UploadFile=File(...), crawl_date: Optional[str]=Form(default=None), s: Session=Depends(db)):
+    day = _crawl_date(file.filename or "", crawl_date)
+    if s.query(CrawlBatch).filter_by(crawl_date=day).first(): raise HTTPException(409, f"{day} 배치가 이미 있습니다. 기존 기록은 자동으로 덮어쓰지 않습니다.")
+    rows = _read_crawl_file(file.filename or "", await file.read())
+    batch = CrawlBatch(crawl_date=day, source_filename=(file.filename or "upload")[:300], row_count=len(rows))
+    s.add(batch); s.flush()
+    s.add_all([CrawlRow(batch_id=batch.id, **row) for row in rows])
+    s.commit()
+    return {"batch_id":batch.id,"crawl_date":day,"row_count":len(rows),"status":"completed"}
+
+@app.get("/api/crawl-batches", dependencies=[Depends(auth)])
+def list_crawl_batches(s: Session=Depends(db)):
+    return [{"id":b.id,"crawl_date":b.crawl_date,"source_filename":b.source_filename,"row_count":b.row_count,"imported_at":b.imported_at}
+            for b in s.query(CrawlBatch).order_by(CrawlBatch.crawl_date.desc()).all()]
+
+@app.get("/api/crawl-batches/compare", dependencies=[Depends(auth)])
+def compare_crawl_batches(previous_id: int, current_id: int, s: Session=Depends(db)):
+    old=s.get(CrawlBatch,previous_id); new=s.get(CrawlBatch,current_id)
+    if not old or not new or old.id==new.id: raise HTTPException(400,"서로 다른 두 날짜의 배치를 선택해 주세요.")
+    a={x.option_id:x for x in s.query(CrawlRow).filter_by(batch_id=old.id).all()}; b={x.option_id:x for x in s.query(CrawlRow).filter_by(batch_id=new.id).all()}
+    ids=set(a)&set(b); products={}
+    for p in s.query(Product).filter(Product.option_id.in_(ids)).all(): products.setdefault(p.option_id,[]).append(p)
+    out=[]; missing_master=0
+    for oid in ids:
+        x,y=a[oid],b[oid]
+        if x.price==y.price and x.sold_out==y.sold_out and x.stock==y.stock: continue
+        matched=products.get(oid,[])
+        if not matched: missing_master+=1
+        p=matched[0] if len(matched)==1 else None
+        name=(p.name if p else y.name)
+        url=f"https://www.coupang.com/vp/products/{urllib.parse.quote(y.exposure_id,safe='')}?vendorItemId={urllib.parse.quote(oid,safe='')}" if y.exposure_id else None
+        candidate_rows=s.query(NaverCandidate).filter_by(batch_id=new.id,option_id=oid).order_by(NaverCandidate.reviewed_at.desc()).all()
+        out.append({"option_id":oid,"sku_id":p.sku_id if p else None,"name":name,"crawl_name":y.name,"barcode":p.barcode if p else None,
+          "previous_price":x.price,"current_price":y.price,"delta":y.price-x.price,"previous_stock":x.stock,"current_stock":y.stock,
+          "previous_sold_out":x.sold_out,"current_sold_out":y.sold_out,"previous_date":old.crawl_date,"current_date":new.crawl_date,
+          "coupang_url":url,"naver_search_url":"https://search.shopping.naver.com/search/all?query="+urllib.parse.quote((p.barcode+" "+name).strip() if p and p.barcode else name),
+          "match_evidence":("마스터 옵션ID 일치" if p else "마스터에서 옵션ID를 찾지 못함; 크롤링 상품명으로 표시"),
+          "candidates":[{"id":c.id,"product_name":c.product_name,"price":c.price,"seller":c.seller,"url":c.url,"evidence":c.evidence} for c in candidate_rows]})
+    out.sort(key=lambda v:abs(v["delta"]),reverse=True)
+    return {"previous":{"id":old.id,"date":old.crawl_date,"row_count":old.row_count},"current":{"id":new.id,"date":new.crawl_date,"row_count":new.row_count},
+      "compared_count":len(ids),"changed_count":len(out),"previous_only_count":len(set(a)-set(b)),"current_only_count":len(set(b)-set(a)),
+      "unmatched_master_changes":missing_master,"items":out,"note":"가격/재고/품절 변동의 동시 발생은 원인 확정이 아닙니다. 네이버 후보는 참고 자료이며 직접 검토해 주세요."}
+
+@app.post("/api/naver-candidates", dependencies=[Depends(auth)])
+def add_naver_candidate(data: CandidateIn, s: Session=Depends(db)):
+    if not s.query(CrawlRow).filter_by(batch_id=data.batch_id,option_id=data.option_id).first(): raise HTTPException(404,"해당 배치의 옵션을 찾을 수 없습니다.")
+    if data.url and not data.url.startswith(("https://", "http://")): raise HTTPException(400,"후보 URL은 http(s) 주소여야 합니다.")
+    row=NaverCandidate(**data.model_dump());s.add(row);s.commit();return {"id":row.id,"ok":True}
+
 # 이전 버전 클라이언트 호환용 동기 API. 새 대시보드는 위의 백그라운드 API를 사용합니다.
 @app.post("/api/import-xlsx", dependencies=[Depends(auth)])
 async def import_xlsx(file: UploadFile=File(...), s:Session=Depends(db)):
@@ -359,42 +410,6 @@ async def import_xlsx(file: UploadFile=File(...), s:Session=Depends(db)):
         except (TypeError, ValueError): p.source_sale_price=None
         p.search_term=val("외부 검색어(자동생성)"); p.tracking=(val("추적 여부") or "Y").upper() in ("Y","YES","1","TRUE")
     s.commit(); wb.close(); return {"added":added,"updated":updated,"total":s.query(func.count(Product.id)).scalar()}
-
-@app.get("/api/coupang/config", dependencies=[Depends(auth)])
-def coupang_config():
-    return {"configured": bool(settings.coupang_access_key and settings.coupang_secret_key and settings.coupang_vendor_id),
-            "missing": [name for name, value in (("COUPANG_ACCESS_KEY", settings.coupang_access_key), ("COUPANG_SECRET_KEY", settings.coupang_secret_key), ("COUPANG_VENDOR_ID", settings.coupang_vendor_id)) if not value]}
-
-@app.post("/api/coupang/test", dependencies=[Depends(auth)])
-def coupang_test(s: Session=Depends(db)):
-    p = s.query(Product).filter(Product.tracking.is_(True), Product.option_id.isnot(None), Product.option_id != "").order_by(Product.sku_id).first()
-    if not p: raise HTTPException(400, "테스트할 옵션 ID가 등록된 상품이 없습니다.")
-    try:
-        result = _coupang_request(p.option_id)
-    except Exception as e:
-        raise HTTPException(502, str(e))
-    return {"sku_id":p.sku_id,"name":p.name,"option_id":p.option_id,"sale_price":result["price"],
-            "on_sale":result["on_sale"],"stock":result["stock"],
-            "note":"API salePrice 수신 성공. 실제 소비자 노출가격과 동일하다는 뜻은 아니며, 가격 변동 감지 지표로 검증합니다."}
-
-@app.post("/api/coupang/collect/start", dependencies=[Depends(auth)])
-def start_coupang_collection(background_tasks: BackgroundTasks, max_items: Optional[int]=None, s: Session=Depends(db)):
-    if not (settings.coupang_access_key and settings.coupang_secret_key and settings.coupang_vendor_id):
-        raise HTTPException(400, "쿠팡 API 환경변수 3개를 먼저 설정해야 합니다.")
-    active = s.query(CoupangCollectionJob).filter(CoupangCollectionJob.status.in_(["queued", "processing"])).first()
-    if active: raise HTTPException(409, "이미 쿠팡 가격 수집이 진행 중입니다.")
-    if max_items is not None and not (1 <= max_items <= 20): raise HTTPException(400, "시험 수집은 1~20개 범위만 허용합니다.")
-    job = CoupangCollectionJob(status="queued"); s.add(job); s.commit(); s.refresh(job)
-    background_tasks.add_task(_run_coupang_collection, job.id, max_items)
-    return {"job_id":job.id,"status":"queued","test_mode":max_items is not None}
-
-@app.get("/api/coupang/collect/status/{job_id}", dependencies=[Depends(auth)])
-def coupang_collection_status(job_id:int, s:Session=Depends(db)):
-    job=s.get(CoupangCollectionJob, job_id)
-    if not job: raise HTTPException(404, "쿠팡 가격 수집 작업을 찾을 수 없습니다.")
-    percent=100 if job.status=="completed" else (round(job.processed/job.total*100) if job.total else 0)
-    return {"job_id":job.id,"status":job.status,"total":job.total,"processed":job.processed,"percent":percent,
-            "succeeded":job.succeeded,"failed":job.failed,"error":job.error}
 
 @app.post("/api/prices", dependencies=[Depends(auth)])
 def add_price(data:PriceIn,s:Session=Depends(db)):
@@ -475,7 +490,7 @@ def alerts(limit:int=50,s:Session=Depends(db)):
 
 @app.get("/api/settings", dependencies=[Depends(auth)])
 def get_settings():
-    return {"coupang_provider":"허용된 가격 데이터 경로 확인 필요","competitor_provider":"사용 안 함","email_notifications":"사용 안 함","scheduled_collection":"사용 안 함"}
+    return {"coupang_provider":"수동 업로드 배치","competitor_provider":"네이버 수동 검색 링크","email_notifications":"사용 안 함","scheduled_collection":"사용 안 함"}
 
 @app.get("/api/export.csv", dependencies=[Depends(auth)])
 def export_csv(s:Session=Depends(db)):
