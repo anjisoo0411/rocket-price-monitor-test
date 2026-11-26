@@ -1,4 +1,4 @@
-# Rocket Price Monitor 0.5.0
+# Rocket Price Monitor 0.5.1
 
 Manual investigation tool for comparing daily Coupang crawl exports and reviewing possible Naver Shopping candidates.
 

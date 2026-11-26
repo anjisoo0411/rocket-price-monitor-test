@@ -8,7 +8,7 @@ from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings
-from sqlalchemy import create_engine, String, Integer, Float, DateTime, ForeignKey, Text, func, or_, UniqueConstraint
+from sqlalchemy import create_engine, String, Integer, Float, DateTime, ForeignKey, Text, func, or_, UniqueConstraint, insert
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship, sessionmaker, Session
 from openpyxl import load_workbook
 
@@ -180,7 +180,7 @@ def home(): return (BASE / "app" / "static" / "index.html").read_text(encoding="
 
 @app.get("/api/health")
 def health():
-    return {"status":"ok", "version":"0.5.0", "price_collection":"manual_dated_batch_upload", "competitor_provider":"manual_naver_search"}
+    return {"status":"ok", "version":"0.5.1", "price_collection":"manual_dated_batch_upload", "competitor_provider":"manual_naver_search"}
 
 @app.get("/api/summary", dependencies=[Depends(auth)])
 def summary(s: Session=Depends(db)):
@@ -345,7 +345,10 @@ async def upload_crawl_batch(file: UploadFile=File(...), crawl_date: Optional[st
     rows = _read_crawl_file(file.filename or "", await file.read())
     batch = CrawlBatch(crawl_date=day, source_filename=(file.filename or "upload")[:300], row_count=len(rows))
     s.add(batch); s.flush()
-    s.add_all([CrawlRow(batch_id=batch.id, **row) for row in rows])
+    # Core executemany avoids creating and returning 15k ORM objects in a single request.
+    payload = [dict(batch_id=batch.id, **row) for row in rows]
+    for start in range(0, len(payload), 1000):
+        s.execute(insert(CrawlRow), payload[start:start + 1000])
     s.commit()
     return {"batch_id":batch.id,"crawl_date":day,"row_count":len(rows),"status":"completed"}
 
