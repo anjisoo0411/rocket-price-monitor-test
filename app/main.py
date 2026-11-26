@@ -115,6 +115,28 @@ class NaverCandidate(Base):
     evidence: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     reviewed_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
 
+class SellerOfferBatch(Base):
+    """One current product/price export supplied by an authorized seller center."""
+    __tablename__ = "seller_offer_batches"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    source: Mapped[str] = mapped_column(String(100), index=True)
+    source_filename: Mapped[str] = mapped_column(String(300))
+    row_count: Mapped[int] = mapped_column(Integer, default=0)
+    imported_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc), index=True)
+
+class SellerOffer(Base):
+    __tablename__ = "seller_offers"
+    __table_args__ = (UniqueConstraint("batch_id", "source_product_id", name="uq_seller_offer_product_per_batch"),)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    batch_id: Mapped[int] = mapped_column(ForeignKey("seller_offer_batches.id", ondelete="CASCADE"), index=True)
+    source_product_id: Mapped[Optional[str]] = mapped_column(String(100), nullable=True, index=True)
+    seller_code: Mapped[Optional[str]] = mapped_column(String(100), nullable=True, index=True)
+    barcode: Mapped[Optional[str]] = mapped_column(String(40), nullable=True, index=True)
+    product_name: Mapped[str] = mapped_column(String(700), index=True)
+    price: Mapped[int] = mapped_column(Integer)
+    seller: Mapped[Optional[str]] = mapped_column(String(250), nullable=True)
+    url: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
 class AlertEvent(Base):
     __tablename__ = "alert_events"
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -141,7 +163,7 @@ def migrate_product_columns():
                 conn.exec_driver_sql(f"ALTER TABLE products ADD COLUMN {name} {sql_type}")
 migrate_product_columns()
 
-app = FastAPI(title="Rocket Price Investigation", version="0.4.2")
+app = FastAPI(title="Rocket Price Investigation", version="0.7.0")
 app.mount("/static", StaticFiles(directory=str(BASE / "app" / "static")), name="static")
 
 def db():
@@ -180,7 +202,7 @@ def home(): return (BASE / "app" / "static" / "index.html").read_text(encoding="
 
 @app.get("/api/health")
 def health():
-    return {"status":"ok", "version":"0.6.0", "price_collection":"manual_dated_batch_upload", "competitor_provider":"manual_naver_search"}
+    return {"status":"ok", "version":"0.7.0", "price_collection":"manual_dated_batch_upload", "seller_price_source":"authorized_seller_center_exports"}
 
 @app.get("/api/summary", dependencies=[Depends(auth)])
 def summary(s: Session=Depends(db)):
@@ -188,7 +210,7 @@ def summary(s: Session=Depends(db)):
     tracked=s.query(func.count(Product.id)).filter(Product.tracking.is_(True)).scalar() or 0
     with_prices=s.query(func.count(func.distinct(PriceSnapshot.product_id))).scalar() or 0
     alerts=s.query(func.count(AlertEvent.id)).scalar() or 0
-    return {"total_products":total,"tracked_products":tracked,"products_with_prices":with_prices,"alerts":alerts,"price_sources": ["쿠팡"],"last_update":s.query(func.max(PriceSnapshot.verified_at)).scalar()}
+    return {"total_products":total,"tracked_products":tracked,"products_with_prices":with_prices,"alerts":alerts,"price_sources": ["쿠팡", "판매자센터 내보내기"],"last_update":s.query(func.max(PriceSnapshot.verified_at)).scalar()}
 
 @app.get("/api/products", dependencies=[Depends(auth)])
 def products(q: str="", page:int=1, limit:int=50, s:Session=Depends(db)):
@@ -338,6 +360,120 @@ def _read_crawl_file(filename: str, raw: bytes):
     if not result: raise HTTPException(400, "가져올 데이터 행이 없습니다.")
     return result
 
+def _read_seller_export(filename: str, raw: bytes):
+    """Read a seller-center product list export. No seller-site crawling is performed."""
+    if filename.lower().endswith((".xlsx", ".xlsm")):
+        wb = load_workbook(io.BytesIO(raw), read_only=True, data_only=True)
+        try:
+            ws = wb.active
+            matrix = list(ws.iter_rows(values_only=True))
+        finally:
+            wb.close()
+    elif filename.lower().endswith(".csv"):
+        try:
+            content = raw.decode("utf-8-sig")
+        except UnicodeDecodeError:
+            content = raw.decode("cp949")
+        matrix = list(csv.reader(io.StringIO(content)))
+    else:
+        raise HTTPException(400, ".xlsx 또는 .csv 판매자센터 내보내기 파일을 선택해 주세요.")
+    aliases = {
+        "name": {"상품명", "스마트스토어상품명", "판매상품명", "상품명(스마트스토어)"},
+        "price": {"판매가", "판매가격", "상품판매가", "판매가(원)", "판매가격(원)"},
+        "product_id": {"상품번호", "스마트스토어상품번호", "상품ID", "상품ID(스마트스토어)"},
+        "seller_code": {"판매자상품코드", "판매자코드", "상품코드", "판매자관리코드"},
+        "barcode": {"바코드", "표준바코드", "EAN", "UPC"},
+        "url": {"상품URL", "상품주소", "스마트스토어URL", "판매URL", "URL"},
+        "seller": {"판매처", "스토어명", "판매자명", "판매자"},
+    }
+    def normalized(v):
+        return re.sub(r"[\s_()（）\-]+", "", str(v or "").strip()).lower()
+    normalized_aliases = {key:{normalized(v) for v in values} for key,values in aliases.items()}
+    header_row = None; indexes = None
+    for row_no, row in enumerate(matrix[:30]):
+        names = [normalized(v) for v in row]
+        found = {key: next((i for i,v in enumerate(names) if v in vals), None) for key,vals in normalized_aliases.items()}
+        if found["name"] is not None and found["price"] is not None:
+            header_row = row_no; indexes = found; break
+    if indexes is None:
+        raise HTTPException(400, "판매자센터 파일에서 상품명과 판매가 열을 찾지 못했습니다. 내보낸 원본 파일을 선택해 주세요.")
+    def cell(row, key):
+        i = indexes.get(key)
+        return row[i] if i is not None and i < len(row) else None
+    def clean(v):
+        if v in (None, ""): return None
+        if isinstance(v, (int,float)) and float(v).is_integer(): return str(int(v))
+        return str(v).strip()
+    result=[]; seen=set()
+    for row_no, row in enumerate(matrix[header_row+1:], start=header_row+1):
+        name = clean(cell(row,"name"))
+        if not name: continue
+        raw_price = cell(row,"price")
+        try: price = int(float(str(raw_price).replace(",","").replace("원","").strip()))
+        except (TypeError, ValueError):
+            # Ignore summary/header lines, but reject actual named products with invalid prices.
+            raise HTTPException(400, f"판매가 숫자 형식을 확인해 주세요: {name[:80]}")
+        if price <= 0: continue
+        product_id=clean(cell(row,"product_id")); code=clean(cell(row,"seller_code")); barcode=clean(cell(row,"barcode"))
+        # SmartStore exports commonly place the barcode in seller product code.
+        if not barcode and code and re.fullmatch(r"\d{8,14}", code): barcode=code
+        url=clean(cell(row,"url"))
+        if url and not url.startswith(("https://","http://")): url=None
+        key=product_id or code or f"{normalized(name)}|{price}"
+        if key in seen: key=f"{key}|{row_no}"
+        seen.add(key)
+        result.append({"source_product_id":key,"seller_code":code,"barcode":barcode,"product_name":name,"price":price,
+                       "seller":clean(cell(row,"seller")),"url":url})
+    if not result: raise HTTPException(400, "판매자센터 파일에 가져올 상품 행이 없습니다.")
+    return result
+
+def _name_tokens(value):
+    tokens = re.findall(r"[0-9a-z가-힣]+", (value or "").lower())
+    ignored = {"엑씨", "엑시", "휴대폰", "스마트폰", "케이스", "보호", "필름", "갤럭시", "맥세이프", "호환", "용", "용품"}
+    return {t for t in tokens if len(t) > 1 and t not in ignored}
+
+def _seller_offer_matches(offers, product: Optional[Product], crawl_name: str, coupang_price: int):
+    """Return different-priced own-store offers, ranking verified identifiers first."""
+    if not offers: return []
+    target_barcode = (product.barcode or "").strip() if product else ""
+    target_tokens = _name_tokens(product.name if product else crawl_name)
+    scored=[]
+    for offer, source in offers:
+        if offer.price == coupang_price: continue
+        if target_barcode and offer.barcode and target_barcode == offer.barcode:
+            score=1.0; evidence="바코드 일치"
+        else:
+            candidate_tokens=_name_tokens(offer.product_name)
+            overlap=target_tokens & candidate_tokens
+            score=(len(overlap)/len(target_tokens | candidate_tokens)) if target_tokens and candidate_tokens else 0.0
+            if score < 0.28: continue
+            evidence=f"상품명 단어 유사도 {round(score*100)}%"
+        scored.append({"source":source,"product_name":offer.product_name,"price":offer.price,"price_delta":offer.price-coupang_price,
+                       "seller":offer.seller or source,"url":offer.url,"seller_code":offer.seller_code,"barcode":offer.barcode,
+                       "match_score":round(score,3),"match_evidence":evidence,"is_same_price":False})
+    by_source={}
+    for row in sorted(scored,key=lambda x:(x["match_score"],abs(x["price_delta"])),reverse=True):
+        by_source.setdefault(row["source"],[])
+        if len(by_source[row["source"]])<3: by_source[row["source"]].append(row)
+    return [row for source_rows in by_source.values() for row in source_rows]
+
+@app.post("/api/seller-batches", dependencies=[Depends(auth)])
+async def upload_seller_batch(source: str=Form(...), file: UploadFile=File(...), s: Session=Depends(db)):
+    source=source.strip()
+    if not source or len(source)>100: raise HTTPException(400,"판매처 이름을 입력해 주세요.")
+    rows=_read_seller_export(file.filename or "upload", await file.read())
+    batch=SellerOfferBatch(source=source,source_filename=(file.filename or "upload")[:300],row_count=len(rows)); s.add(batch); s.flush()
+    for start in range(0,len(rows),1000):
+        s.execute(insert(SellerOffer),[dict(batch_id=batch.id,**row) for row in rows[start:start+1000]])
+    s.commit()
+    return {"batch_id":batch.id,"source":source,"row_count":len(rows),"status":"completed"}
+
+@app.get("/api/seller-batches", dependencies=[Depends(auth)])
+def list_seller_batches(s: Session=Depends(db)):
+    latest=s.query(func.max(SellerOfferBatch.id).label("id")).group_by(SellerOfferBatch.source).subquery()
+    rows=s.query(SellerOfferBatch).join(latest,SellerOfferBatch.id==latest.c.id).order_by(SellerOfferBatch.source).all()
+    return [{"id":b.id,"source":b.source,"source_filename":b.source_filename,"row_count":b.row_count,"imported_at":b.imported_at} for b in rows]
+
 @app.post("/api/crawl-batches", dependencies=[Depends(auth)])
 async def upload_crawl_batch(file: UploadFile=File(...), crawl_date: Optional[str]=Form(default=None), s: Session=Depends(db)):
     day = _crawl_date(file.filename or "", crawl_date)
@@ -363,6 +499,8 @@ def compare_crawl_batches(previous_id: int, current_id: int, s: Session=Depends(
     if not old or not new or old.id==new.id: raise HTTPException(400,"서로 다른 두 날짜의 배치를 선택해 주세요.")
     a={x.option_id:x for x in s.query(CrawlRow).filter_by(batch_id=old.id).all()}; b={x.option_id:x for x in s.query(CrawlRow).filter_by(batch_id=new.id).all()}
     ids=set(a)&set(b); products={}
+    latest_offer_ids=s.query(func.max(SellerOfferBatch.id).label("id")).group_by(SellerOfferBatch.source).subquery()
+    offer_rows=s.query(SellerOffer,SellerOfferBatch.source).join(SellerOfferBatch,SellerOfferBatch.id==SellerOffer.batch_id).join(latest_offer_ids,SellerOfferBatch.id==latest_offer_ids.c.id).all()
     for p in s.query(Product).filter(Product.option_id.in_(ids)).all(): products.setdefault(p.option_id,[]).append(p)
     out=[]; missing_master=0; price_changed_count=0; inventory_changed_count=0
     for oid in ids:
@@ -378,19 +516,19 @@ def compare_crawl_batches(previous_id: int, current_id: int, s: Session=Depends(
         p=matched[0] if len(matched)==1 else None
         name=(p.name if p else y.name)
         url=f"https://www.coupang.com/vp/products/{urllib.parse.quote(y.exposure_id,safe='')}?vendorItemId={urllib.parse.quote(oid,safe='')}" if y.exposure_id else None
-        candidate_rows=s.query(NaverCandidate).filter_by(batch_id=new.id,option_id=oid).order_by(NaverCandidate.reviewed_at.desc()).all()
+        seller_matches=_seller_offer_matches(offer_rows,p,y.name,y.price) if "price" in change_types else []
         out.append({"option_id":oid,"sku_id":p.sku_id if p else None,"name":name,"crawl_name":y.name,"barcode":p.barcode if p else None,
           "previous_price":x.price,"current_price":y.price,"delta":y.price-x.price,"previous_stock":x.stock,"current_stock":y.stock,
           "previous_sold_out":x.sold_out,"current_sold_out":y.sold_out,"previous_date":old.crawl_date,"current_date":new.crawl_date,
           "change_types":change_types,
-          "coupang_url":url,"naver_search_url":"https://search.shopping.naver.com/search/all?query="+urllib.parse.quote((p.barcode+" "+name).strip() if p and p.barcode else name),
+          "coupang_url":url,
           "match_evidence":("마스터 옵션ID 일치" if p else "마스터에서 옵션ID를 찾지 못함; 크롤링 상품명으로 표시"),
-          "candidates":[{"id":c.id,"product_name":c.product_name,"price":c.price,"seller":c.seller,"url":c.url,"evidence":c.evidence} for c in candidate_rows]})
+          "seller_price_matches":seller_matches})
     out.sort(key=lambda v:abs(v["delta"]),reverse=True)
     return {"previous":{"id":old.id,"date":old.crawl_date,"row_count":old.row_count},"current":{"id":new.id,"date":new.crawl_date,"row_count":new.row_count},
       "compared_count":len(ids),"changed_count":len(out),"price_changed_count":price_changed_count,"inventory_changed_count":inventory_changed_count,
       "previous_only_count":len(set(a)-set(b)),"current_only_count":len(set(b)-set(a)),
-      "unmatched_master_changes":missing_master,"items":out,"note":"가격/재고/품절 변동의 동시 발생은 원인 확정이 아닙니다. 네이버 후보는 참고 자료이며 직접 검토해 주세요."}
+      "unmatched_master_changes":missing_master,"items":out,"note":"쿠팡에서 가격 변동한 상품과 각 판매자센터 내보내기 자료의 자사 상품명을 대조합니다. 후보는 가격 차이와 상품명/바코드 일치 근거를 보여주는 참고 정보이며 원인을 확정하지 않습니다."}
 
 @app.post("/api/naver-candidates", dependencies=[Depends(auth)])
 def add_naver_candidate(data: CandidateIn, s: Session=Depends(db)):
@@ -500,7 +638,7 @@ def alerts(limit:int=50,s:Session=Depends(db)):
 
 @app.get("/api/settings", dependencies=[Depends(auth)])
 def get_settings():
-    return {"coupang_provider":"수동 업로드 배치","competitor_provider":"네이버 수동 검색 링크","email_notifications":"사용 안 함","scheduled_collection":"사용 안 함"}
+    return {"coupang_provider":"수동 업로드 배치","seller_price_provider":"권한이 있는 판매자센터 파일 업로드","email_notifications":"사용 안 함","scheduled_collection":"사용 안 함"}
 
 @app.get("/api/export.csv", dependencies=[Depends(auth)])
 def export_csv(s:Session=Depends(db)):
