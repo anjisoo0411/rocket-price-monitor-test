@@ -149,6 +149,7 @@ class SellerOffer(Base):
     barcode: Mapped[Optional[str]] = mapped_column(String(40), nullable=True, index=True)
     product_name: Mapped[str] = mapped_column(String(700), index=True)
     price: Mapped[int] = mapped_column(Integer)
+    price_basis: Mapped[str] = mapped_column(String(20), default="판매가")
     seller: Mapped[Optional[str]] = mapped_column(String(250), nullable=True)
     url: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
@@ -184,9 +185,13 @@ def migrate_product_columns():
     if "smartstore_product_id" not in offer_columns:
         with engine.begin() as conn:
             conn.exec_driver_sql("ALTER TABLE seller_offers ADD COLUMN smartstore_product_id VARCHAR(100)")
+    offer_columns = {c["name"] for c in inspect(engine).get_columns("seller_offers")}
+    if "price_basis" not in offer_columns:
+        with engine.begin() as conn:
+            conn.exec_driver_sql("ALTER TABLE seller_offers ADD COLUMN price_basis VARCHAR(20) NOT NULL DEFAULT '판매가'")
 migrate_product_columns()
 
-app = FastAPI(title="Rocket Price Investigation", version="0.7.4")
+app = FastAPI(title="Rocket Price Investigation", version="0.7.5")
 app.mount("/static", StaticFiles(directory=str(BASE / "app" / "static")), name="static")
 
 def db():
@@ -225,7 +230,7 @@ def home(): return (BASE / "app" / "static" / "index.html").read_text(encoding="
 
 @app.get("/api/health")
 def health():
-    return {"status":"ok", "version":"0.7.4", "price_collection":"manual_dated_batch_upload", "seller_price_source":"authorized_seller_center_exports"}
+    return {"status":"ok", "version":"0.7.5", "price_collection":"manual_dated_batch_upload", "seller_price_source":"authorized_seller_center_exports"}
 
 @app.get("/api/summary", dependencies=[Depends(auth)])
 def summary(s: Session=Depends(db)):
@@ -402,6 +407,7 @@ def _iter_seller_export(filename: str, raw: bytes):
     aliases = {
         "name": {"상품명", "스마트스토어상품명", "판매상품명", "상품명(스마트스토어)"},
         "price": {"판매가", "판매가격", "상품판매가", "판매가(원)", "판매가격(원)"},
+        "discount_price": {"할인가", "할인가격", "할인판매가", "할인 판매가", "할인가(원)"},
         "product_id": {"상품번호", "스마트스토어상품번호", "상품번호(스마트스토어)", "상품번호스마트스토어", "상품ID", "상품ID(스마트스토어)"},
         "seller_code": {"판매자상품코드", "판매자코드", "상품코드", "판매자관리코드"},
         "barcode": {"바코드", "표준바코드", "EAN", "UPC"},
@@ -416,7 +422,7 @@ def _iter_seller_export(filename: str, raw: bytes):
     for row_no, row in enumerate(prefix):
         names = [normalized(v) for v in row]
         found = {key: next((i for i,v in enumerate(names) if v in vals), None) for key,vals in normalized_aliases.items()}
-        if found["name"] is not None and found["price"] is not None:
+        if found["name"] is not None and (found["price"] is not None or found["discount_price"] is not None):
             header_row = row_no; indexes = found; break
     if indexes is None:
         if wb: wb.close()
@@ -435,8 +441,15 @@ def _iter_seller_export(filename: str, raw: bytes):
             for row_no, row in enumerate(chain(prefix[header_row+1:], iterator), start=header_row+1):
                 name = clean(cell(row,"name"))
                 if not name: continue
-                raw_price = cell(row,"price")
-                try: price = int(float(str(raw_price).replace(",","").replace("원","").strip()))
+                raw_discount = cell(row,"discount_price")
+                price_basis = "할인가"
+                try:
+                    discount_value = int(float(str(raw_discount).replace(",","").replace("원","").strip())) if raw_discount not in (None, "") else 0
+                except (TypeError, ValueError):
+                    discount_value = 0
+                raw_price = raw_discount if discount_value > 0 else cell(row,"price")
+                if discount_value <= 0: price_basis = "판매가"
+                try: price = discount_value if discount_value > 0 else int(float(str(raw_price).replace(",","").replace("원","").strip()))
                 except (TypeError, ValueError):
                     raise HTTPException(400, f"판매가 숫자 형식을 확인해 주세요: {name[:80]}")
                 if price <= 0: continue
@@ -447,7 +460,7 @@ def _iter_seller_export(filename: str, raw: bytes):
                 key=product_id or code or f"{normalized(name)}|{price}"
                 if key in seen: key=f"{key}|{row_no}"
                 seen.add(key); count += 1
-                yield {"source_product_id":key,"smartstore_product_id":product_id,"seller_code":code,"barcode":barcode,"product_name":name,"price":price,
+                yield {"source_product_id":key,"smartstore_product_id":product_id,"seller_code":code,"barcode":barcode,"product_name":name,"price":price,"price_basis":price_basis,
                        "seller":clean(cell(row,"seller")),"url":url}
             if not count: raise HTTPException(400, "판매자센터 파일에 가져올 상품 행이 없습니다.")
         finally:
@@ -485,7 +498,7 @@ def _seller_offer_matches(offers, product: Optional[Product], crawl_name: str, c
             product_number=(offer.smartstore_product_id or "").strip()
             if re.fullmatch(r"\d{6,20}",product_number):
                 candidate_url=f"https://smartstore.naver.com/excci/products/{product_number}"
-        scored.append({"source":source,"product_name":offer.product_name,"price":offer.price,"price_delta":offer.price-coupang_price,
+        scored.append({"source":source,"product_name":offer.product_name,"price":offer.price,"price_basis":offer.price_basis or "판매가","price_delta":offer.price-coupang_price,
                        "seller":offer.seller or source,"url":candidate_url,"seller_code":offer.seller_code,"barcode":offer.barcode,
                        "match_score":round(score,3),"match_evidence":evidence,"is_same_price":False})
     by_source={}
