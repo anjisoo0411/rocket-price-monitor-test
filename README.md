@@ -1,4 +1,4 @@
-# Rocket Price Monitor 0.7.3
+# Rocket Price Monitor 0.7.4
 
 Manual investigation tool for comparing daily Coupang crawl exports with EXCCI's own product prices exported from seller centers where the user has access. Seller CSV records are streamed and saved in bounded batches by a background job, with progress shown in the page. SmartStore candidate product names open the EXCCI SmartStore listing when a numeric SmartStore product number is available.
 

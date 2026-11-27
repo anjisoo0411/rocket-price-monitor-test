@@ -144,6 +144,7 @@ class SellerOffer(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     batch_id: Mapped[int] = mapped_column(ForeignKey("seller_offer_batches.id", ondelete="CASCADE"), index=True)
     source_product_id: Mapped[Optional[str]] = mapped_column(String(100), nullable=True, index=True)
+    smartstore_product_id: Mapped[Optional[str]] = mapped_column(String(100), nullable=True, index=True)
     seller_code: Mapped[Optional[str]] = mapped_column(String(100), nullable=True, index=True)
     barcode: Mapped[Optional[str]] = mapped_column(String(40), nullable=True, index=True)
     product_name: Mapped[str] = mapped_column(String(700), index=True)
@@ -179,9 +180,13 @@ def migrate_product_columns():
     if "status" not in batch_columns:
         with engine.begin() as conn:
             conn.exec_driver_sql("ALTER TABLE seller_offer_batches ADD COLUMN status VARCHAR(20) NOT NULL DEFAULT 'completed'")
+    offer_columns = {c["name"] for c in inspect(engine).get_columns("seller_offers")}
+    if "smartstore_product_id" not in offer_columns:
+        with engine.begin() as conn:
+            conn.exec_driver_sql("ALTER TABLE seller_offers ADD COLUMN smartstore_product_id VARCHAR(100)")
 migrate_product_columns()
 
-app = FastAPI(title="Rocket Price Investigation", version="0.7.3")
+app = FastAPI(title="Rocket Price Investigation", version="0.7.4")
 app.mount("/static", StaticFiles(directory=str(BASE / "app" / "static")), name="static")
 
 def db():
@@ -220,7 +225,7 @@ def home(): return (BASE / "app" / "static" / "index.html").read_text(encoding="
 
 @app.get("/api/health")
 def health():
-    return {"status":"ok", "version":"0.7.3", "price_collection":"manual_dated_batch_upload", "seller_price_source":"authorized_seller_center_exports"}
+    return {"status":"ok", "version":"0.7.4", "price_collection":"manual_dated_batch_upload", "seller_price_source":"authorized_seller_center_exports"}
 
 @app.get("/api/summary", dependencies=[Depends(auth)])
 def summary(s: Session=Depends(db)):
@@ -442,7 +447,7 @@ def _iter_seller_export(filename: str, raw: bytes):
                 key=product_id or code or f"{normalized(name)}|{price}"
                 if key in seen: key=f"{key}|{row_no}"
                 seen.add(key); count += 1
-                yield {"source_product_id":key,"seller_code":code,"barcode":barcode,"product_name":name,"price":price,
+                yield {"source_product_id":key,"smartstore_product_id":product_id,"seller_code":code,"barcode":barcode,"product_name":name,"price":price,
                        "seller":clean(cell(row,"seller")),"url":url}
             if not count: raise HTTPException(400, "판매자센터 파일에 가져올 상품 행이 없습니다.")
         finally:
@@ -477,7 +482,7 @@ def _seller_offer_matches(offers, product: Optional[Product], crawl_name: str, c
             evidence=f"상품명 단어 유사도 {round(score*100)}%"
         candidate_url=offer.url
         if not candidate_url and ("스마트스토어" in source.lower() or "smartstore" in source.lower()):
-            product_number=(offer.source_product_id or "").split("|",1)[0].strip()
+            product_number=(offer.smartstore_product_id or "").strip()
             if re.fullmatch(r"\d{6,20}",product_number):
                 candidate_url=f"https://smartstore.naver.com/excci/products/{product_number}"
         scored.append({"source":source,"product_name":offer.product_name,"price":offer.price,"price_delta":offer.price-coupang_price,
