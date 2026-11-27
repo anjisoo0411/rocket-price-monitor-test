@@ -181,7 +181,7 @@ def migrate_product_columns():
             conn.exec_driver_sql("ALTER TABLE seller_offer_batches ADD COLUMN status VARCHAR(20) NOT NULL DEFAULT 'completed'")
 migrate_product_columns()
 
-app = FastAPI(title="Rocket Price Investigation", version="0.7.1")
+app = FastAPI(title="Rocket Price Investigation", version="0.7.3")
 app.mount("/static", StaticFiles(directory=str(BASE / "app" / "static")), name="static")
 
 def db():
@@ -220,7 +220,7 @@ def home(): return (BASE / "app" / "static" / "index.html").read_text(encoding="
 
 @app.get("/api/health")
 def health():
-    return {"status":"ok", "version":"0.7.1", "price_collection":"manual_dated_batch_upload", "seller_price_source":"authorized_seller_center_exports"}
+    return {"status":"ok", "version":"0.7.3", "price_collection":"manual_dated_batch_upload", "seller_price_source":"authorized_seller_center_exports"}
 
 @app.get("/api/summary", dependencies=[Depends(auth)])
 def summary(s: Session=Depends(db)):
@@ -397,7 +397,7 @@ def _iter_seller_export(filename: str, raw: bytes):
     aliases = {
         "name": {"상품명", "스마트스토어상품명", "판매상품명", "상품명(스마트스토어)"},
         "price": {"판매가", "판매가격", "상품판매가", "판매가(원)", "판매가격(원)"},
-        "product_id": {"상품번호", "스마트스토어상품번호", "상품ID", "상품ID(스마트스토어)"},
+        "product_id": {"상품번호", "스마트스토어상품번호", "상품번호(스마트스토어)", "상품번호스마트스토어", "상품ID", "상품ID(스마트스토어)"},
         "seller_code": {"판매자상품코드", "판매자코드", "상품코드", "판매자관리코드"},
         "barcode": {"바코드", "표준바코드", "EAN", "UPC"},
         "url": {"상품URL", "상품주소", "스마트스토어URL", "판매URL", "URL"},
@@ -475,8 +475,13 @@ def _seller_offer_matches(offers, product: Optional[Product], crawl_name: str, c
             score=(len(overlap)/len(target_tokens | candidate_tokens)) if target_tokens and candidate_tokens else 0.0
             if score < 0.28: continue
             evidence=f"상품명 단어 유사도 {round(score*100)}%"
+        candidate_url=offer.url
+        if not candidate_url and ("스마트스토어" in source.lower() or "smartstore" in source.lower()):
+            product_number=(offer.source_product_id or "").split("|",1)[0].strip()
+            if re.fullmatch(r"\d{6,20}",product_number):
+                candidate_url=f"https://smartstore.naver.com/excci/products/{product_number}"
         scored.append({"source":source,"product_name":offer.product_name,"price":offer.price,"price_delta":offer.price-coupang_price,
-                       "seller":offer.seller or source,"url":offer.url,"seller_code":offer.seller_code,"barcode":offer.barcode,
+                       "seller":offer.seller or source,"url":candidate_url,"seller_code":offer.seller_code,"barcode":offer.barcode,
                        "match_score":round(score,3),"match_evidence":evidence,"is_same_price":False})
     by_source={}
     for row in sorted(scored,key=lambda x:(x["match_score"],abs(x["price_delta"])),reverse=True):
