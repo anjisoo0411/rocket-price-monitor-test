@@ -191,7 +191,7 @@ def migrate_product_columns():
             conn.exec_driver_sql("ALTER TABLE seller_offers ADD COLUMN price_basis VARCHAR(20) NOT NULL DEFAULT '판매가'")
 migrate_product_columns()
 
-app = FastAPI(title="Rocket Price Investigation", version="0.7.7")
+app = FastAPI(title="Rocket Price Investigation", version="0.7.8")
 app.mount("/static", StaticFiles(directory=str(BASE / "app" / "static")), name="static")
 
 def db():
@@ -230,7 +230,7 @@ def home(): return (BASE / "app" / "static" / "index.html").read_text(encoding="
 
 @app.get("/api/health")
 def health():
-    return {"status":"ok", "version":"0.7.7", "price_collection":"manual_dated_batch_upload", "seller_price_source":"authorized_seller_center_exports"}
+    return {"status":"ok", "version":"0.7.8", "price_collection":"manual_dated_batch_upload", "seller_price_source":"authorized_seller_center_exports"}
 
 @app.get("/api/summary", dependencies=[Depends(auth)])
 def summary(s: Session=Depends(db)):
@@ -472,14 +472,24 @@ def _read_seller_export(filename: str, raw: bytes):
     """Compatibility helper for small test inputs; the production import streams rows."""
     return list(_iter_seller_export(filename, raw))
 
-def _name_tokens(value):
-    tokens = re.findall(r"[0-9a-z가-힣]+", (value or "").lower())
-    ignored = {"엑씨", "엑시", "휴대폰", "스마트폰", "케이스", "보호", "필름", "갤럭시", "맥세이프", "호환", "용", "용품"}
-    result = {t for t in tokens if len(t) > 1 and t not in ignored}
-    # Normalize common title variants so spacing and compound nouns do not hide a match.
-    if any(t.startswith("초슬림") for t in result): result.add("초슬림")
-    if "액정보호필름" in result or "강화유리필름" in result: result.add("보호필름")
-    return result
+def _leading_identity_tokens(value):
+    """Extract the first product-descriptor words after removing model, pack, and color tails."""
+    text = (value or "").lower()
+    model_patterns = (
+        r"(?:갤럭시|galaxy|samsung|삼성)?\s*(?:z\s*)?(?:fold|폴드|flip|플립)\s*\d{1,2}(?:\s*(?:ultra|울트라|plus|플러스))?",
+        r"(?:갤럭시|galaxy|samsung|삼성)\s*(?:s|a)\s*\d{1,3}\s*(?:ultra|울트라|plus|플러스|fe|edge|엣지)?",
+        r"(?<![a-z0-9])s\s*\d{1,2}\s*(?:ultra|울트라|plus|플러스|fe|edge|엣지)?",
+        r"(?:아이폰|iphone)\s*\d{1,2}\s*(?:pro\s*max|프로\s*맥스|pro|프로|plus|플러스|mini|미니|air|에어)?",
+        r"(?:ipad|아이패드)\s*(?:pro|air|mini|프로|에어|미니)?\s*\d{0,2}",
+    )
+    for pattern in model_patterns:
+        text = re.sub(pattern, " ", text)
+    text = re.sub(r"(?<!\d)\d[\d,]*\s*(?:개입|세트|팩|매|장|개|입|pcs?|sets?|packs?)(?![a-z0-9])", " ", text)
+    colors = r"블랙|화이트|퍼플|실버|그레이|그레이|그린|핑크|블루|네이비|골드|투명|클리어|레드|옐로우|베이지|브라운|라벤더|민트|보라|검정|흰색|검은색|black|white|purple|silver|gray|grey|green|pink|blue|navy|gold|clear|red|yellow|beige|brown|lavender|mint"
+    text = re.sub(rf"(?<![가-힣a-z])(?:{colors})(?![가-힣a-z])", " ", text)
+    tokens = re.findall(r"[0-9a-z가-힣]+", text)
+    ignored = {"엑씨", "엑시", "excci", "휴대폰", "스마트폰", "케이스", "보호", "필름", "갤럭시", "맥세이프", "호환", "용", "용품", "세트", "세트형", "색상", "컬러", "9h"}
+    return [t for t in tokens if len(t) > 1 and t not in ignored][:6]
 
 def _package_quantity(value):
     """Extract an explicit sellable pack count, keeping set/pack distinct from pieces."""
@@ -537,7 +547,7 @@ def _seller_offer_matches(offers, product: Optional[Product], crawl_name: str, c
     target_name = crawl_name or (product.name if product else "")
     target_quantity = _package_quantity(crawl_name) or _package_quantity(product.name if product else "")
     target_models = _device_model_keys(crawl_name) or _device_model_keys(product.name if product else "")
-    target_tokens = _name_tokens(target_name) | target_models
+    target_leading = _leading_identity_tokens(target_name)
     scored=[]
     for offer, source in offers:
         if offer.price == coupang_price: continue
@@ -549,14 +559,19 @@ def _seller_offer_matches(offers, product: Optional[Product], crawl_name: str, c
         # even if its generic terms or barcode happen to overlap.
         if target_models and candidate_models and not (target_models & candidate_models):
             continue
+        candidate_leading = _leading_identity_tokens(offer.product_name)
+        leading_matches = list(dict.fromkeys(word for word in target_leading if word in set(candidate_leading)))
         if target_barcode and offer.barcode and target_barcode == offer.barcode:
             score=1.0; evidence="바코드 일치"
+            if len(leading_matches) < 2:
+                evidence += " · 상품명 앞부분 상이, 확인 필요"
         else:
-            candidate_tokens=_name_tokens(offer.product_name) | candidate_models
-            overlap=target_tokens & candidate_tokens
-            score=(2*len(overlap)/(len(target_tokens)+len(candidate_tokens))) if target_tokens and candidate_tokens else 0.0
-            if score < 0.40: continue
-            evidence=f"상품명 단어 일치도 {round(score*100)}%"
+            # Do not let shared model, color, or generic trailing words make unrelated
+            # products look alike. At least two of the leading identity words must match.
+            if len(target_leading) < 2 or len(candidate_leading) < 2 or len(leading_matches) < 2:
+                continue
+            score=min(1.0, len(leading_matches)/min(6, len(target_leading), len(candidate_leading)))
+            evidence=f"상품명 앞부분 핵심어 {len(leading_matches)}개 일치 ({', '.join(leading_matches[:4])})"
         if target_quantity is not None and candidate_quantity == target_quantity:
             quantity_unit = {"piece":"개","set":"세트","pack":"팩"}[target_quantity[1]]
             evidence += f" · 구성 수량 {target_quantity[0]}{quantity_unit} 일치"
@@ -571,7 +586,7 @@ def _seller_offer_matches(offers, product: Optional[Product], crawl_name: str, c
                 candidate_url=f"https://smartstore.naver.com/excci/products/{product_number}"
         scored.append({"source":source,"product_name":offer.product_name,"price":offer.price,"price_basis":offer.price_basis or "판매가","price_delta":offer.price-coupang_price,
                        "seller":offer.seller or source,"url":candidate_url,"seller_code":offer.seller_code,"barcode":offer.barcode,
-                       "match_score":round(score,3),"match_evidence":evidence,"is_same_price":False})
+                       "match_score":round(score,3),"leading_match_count":len(leading_matches),"match_evidence":evidence,"is_same_price":False})
     by_source={}
     for row in sorted(scored,key=lambda x:(x["match_score"],abs(x["price_delta"])),reverse=True):
         by_source.setdefault(row["source"],[])
