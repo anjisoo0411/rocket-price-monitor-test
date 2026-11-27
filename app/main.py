@@ -191,7 +191,7 @@ def migrate_product_columns():
             conn.exec_driver_sql("ALTER TABLE seller_offers ADD COLUMN price_basis VARCHAR(20) NOT NULL DEFAULT '판매가'")
 migrate_product_columns()
 
-app = FastAPI(title="Rocket Price Investigation", version="0.7.5")
+app = FastAPI(title="Rocket Price Investigation", version="0.7.6")
 app.mount("/static", StaticFiles(directory=str(BASE / "app" / "static")), name="static")
 
 def db():
@@ -230,7 +230,7 @@ def home(): return (BASE / "app" / "static" / "index.html").read_text(encoding="
 
 @app.get("/api/health")
 def health():
-    return {"status":"ok", "version":"0.7.5", "price_collection":"manual_dated_batch_upload", "seller_price_source":"authorized_seller_center_exports"}
+    return {"status":"ok", "version":"0.7.6", "price_collection":"manual_dated_batch_upload", "seller_price_source":"authorized_seller_center_exports"}
 
 @app.get("/api/summary", dependencies=[Depends(auth)])
 def summary(s: Session=Depends(db)):
@@ -477,14 +477,32 @@ def _name_tokens(value):
     ignored = {"엑씨", "엑시", "휴대폰", "스마트폰", "케이스", "보호", "필름", "갤럭시", "맥세이프", "호환", "용", "용품"}
     return {t for t in tokens if len(t) > 1 and t not in ignored}
 
+def _package_quantity(value):
+    """Extract an explicit sellable pack count, keeping set/pack distinct from pieces."""
+    pattern = re.compile(r"(?<!\d)(\d[\d,]*)\s*(개입|세트|팩|매|장|개|입|pcs?|sets?|packs?)(?![a-z0-9])", re.IGNORECASE)
+    matches = list(pattern.finditer(value or ""))
+    if not matches: return None
+    match = matches[-1]
+    amount = int(match.group(1).replace(",", ""))
+    unit = match.group(2).lower()
+    if unit in {"세트", "set", "sets"}: unit = "set"
+    elif unit in {"팩", "pack", "packs"}: unit = "pack"
+    else: unit = "piece"
+    return amount, unit
+
 def _seller_offer_matches(offers, product: Optional[Product], crawl_name: str, coupang_price: int):
     """Return different-priced own-store offers, ranking verified identifiers first."""
     if not offers: return []
     target_barcode = (product.barcode or "").strip() if product else ""
-    target_tokens = _name_tokens(product.name if product else crawl_name)
+    target_name = product.name if product else crawl_name
+    target_tokens = _name_tokens(target_name)
+    target_quantity = _package_quantity(target_name) or _package_quantity(crawl_name)
     scored=[]
     for offer, source in offers:
         if offer.price == coupang_price: continue
+        candidate_quantity = _package_quantity(offer.product_name)
+        if target_quantity is not None and candidate_quantity is not None and target_quantity != candidate_quantity:
+            continue
         if target_barcode and offer.barcode and target_barcode == offer.barcode:
             score=1.0; evidence="바코드 일치"
         else:
@@ -493,6 +511,9 @@ def _seller_offer_matches(offers, product: Optional[Product], crawl_name: str, c
             score=(len(overlap)/len(target_tokens | candidate_tokens)) if target_tokens and candidate_tokens else 0.0
             if score < 0.28: continue
             evidence=f"상품명 단어 유사도 {round(score*100)}%"
+        if target_quantity is not None and candidate_quantity == target_quantity:
+            quantity_unit = {"piece":"개","set":"세트","pack":"팩"}[target_quantity[1]]
+            evidence += f" · 구성 수량 {target_quantity[0]}{quantity_unit} 일치"
         candidate_url=offer.url
         if not candidate_url and ("스마트스토어" in source.lower() or "smartstore" in source.lower()):
             product_number=(offer.smartstore_product_id or "").strip()
