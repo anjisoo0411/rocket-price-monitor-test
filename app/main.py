@@ -191,7 +191,7 @@ def migrate_product_columns():
             conn.exec_driver_sql("ALTER TABLE seller_offers ADD COLUMN price_basis VARCHAR(20) NOT NULL DEFAULT '판매가'")
 migrate_product_columns()
 
-app = FastAPI(title="Rocket Price Investigation", version="0.7.6")
+app = FastAPI(title="Rocket Price Investigation", version="0.7.7")
 app.mount("/static", StaticFiles(directory=str(BASE / "app" / "static")), name="static")
 
 def db():
@@ -230,7 +230,7 @@ def home(): return (BASE / "app" / "static" / "index.html").read_text(encoding="
 
 @app.get("/api/health")
 def health():
-    return {"status":"ok", "version":"0.7.6", "price_collection":"manual_dated_batch_upload", "seller_price_source":"authorized_seller_center_exports"}
+    return {"status":"ok", "version":"0.7.7", "price_collection":"manual_dated_batch_upload", "seller_price_source":"authorized_seller_center_exports"}
 
 @app.get("/api/summary", dependencies=[Depends(auth)])
 def summary(s: Session=Depends(db)):
@@ -475,7 +475,11 @@ def _read_seller_export(filename: str, raw: bytes):
 def _name_tokens(value):
     tokens = re.findall(r"[0-9a-z가-힣]+", (value or "").lower())
     ignored = {"엑씨", "엑시", "휴대폰", "스마트폰", "케이스", "보호", "필름", "갤럭시", "맥세이프", "호환", "용", "용품"}
-    return {t for t in tokens if len(t) > 1 and t not in ignored}
+    result = {t for t in tokens if len(t) > 1 and t not in ignored}
+    # Normalize common title variants so spacing and compound nouns do not hide a match.
+    if any(t.startswith("초슬림") for t in result): result.add("초슬림")
+    if "액정보호필름" in result or "강화유리필름" in result: result.add("보호필름")
+    return result
 
 def _package_quantity(value):
     """Extract an explicit sellable pack count, keeping set/pack distinct from pieces."""
@@ -490,30 +494,76 @@ def _package_quantity(value):
     else: unit = "piece"
     return amount, unit
 
+def _device_model_keys(value):
+    """Return explicit phone model identifiers so category words cannot bridge unlike devices."""
+    text = (value or "").lower()
+    keys = set()
+    galaxy_context = bool(re.search(r"갤럭시|galaxy|samsung|삼성", text))
+    if galaxy_context and re.search(r"갤럭시\s*탭|galaxy\s*tab", text):
+        for match in re.finditer(r"(?:갤럭시\s*탭|galaxy\s*tab)\s*(s|a)\s*(\d{1,3})\s*(ultra|울트라|plus|플러스)?", text):
+            line = match.group(1).lower()
+            tier = (match.group(3) or "").lower()
+            tier = {"울트라":"ultra", "플러스":"plus"}.get(tier, tier)
+            keys.add(f"galaxy-tab-{line}{match.group(2)}" + (f"-{tier}" if tier else ""))
+    else:
+        for match in re.finditer(r"(?<![a-z0-9])s\s*(\d{1,2})\s*(ultra|울트라|plus|플러스|fe|edge|엣지)?(?![a-z0-9])", text):
+            tier = (match.group(2) or "").lower()
+            tier = {"울트라":"ultra", "플러스":"plus", "엣지":"edge"}.get(tier, tier)
+            keys.add(f"galaxy-s{match.group(1)}" + (f"-{tier}" if tier else ""))
+        if galaxy_context:
+            for match in re.finditer(r"(?<![a-z0-9])a\s*(\d{2,3})(?!\d)", text):
+                keys.add(f"galaxy-a{match.group(1)}")
+    for match in re.finditer(r"(?<![a-z0-9])(?:z\s*)?(fold|폴드|flip|플립)\s*(\d{1,2})(?!\d)", text):
+        family = "fold" if match.group(1) in {"fold", "폴드"} else "flip"
+        keys.add(f"galaxy-z-{family}{match.group(2)}")
+    for match in re.finditer(r"(?:아이폰|iphone)\s*(\d{1,2})\s*(pro\s*max|프로\s*맥스|pro|프로|plus|플러스|mini|미니|air|에어)?", text):
+        tier = re.sub(r"\s+", "", (match.group(2) or "").lower())
+        tier = {"프로맥스":"promax", "프로":"pro", "플러스":"plus", "미니":"mini", "에어":"air"}.get(tier, tier)
+        keys.add(f"iphone-{match.group(1)}" + (f"-{tier}" if tier else ""))
+    if re.search(r"ipad|아이패드", text):
+        for match in re.finditer(r"(?:ipad|아이패드)\s*(pro|air|mini|프로|에어|미니)?\s*(\d{1,2})?", text):
+            family = (match.group(1) or "").lower()
+            family = {"프로":"pro", "에어":"air", "미니":"mini"}.get(family, family)
+            generation = match.group(2) or ""
+            keys.add("ipad" + (f"-{family}" if family else "") + (f"-{generation}" if generation else ""))
+    return keys
+
 def _seller_offer_matches(offers, product: Optional[Product], crawl_name: str, coupang_price: int):
     """Return different-priced own-store offers, ranking verified identifiers first."""
     if not offers: return []
     target_barcode = (product.barcode or "").strip() if product else ""
-    target_name = product.name if product else crawl_name
-    target_tokens = _name_tokens(target_name)
-    target_quantity = _package_quantity(target_name) or _package_quantity(crawl_name)
+    # The current crawl title describes the listing being compared; only fall back to
+    # the product master when the crawl title is absent.
+    target_name = crawl_name or (product.name if product else "")
+    target_quantity = _package_quantity(crawl_name) or _package_quantity(product.name if product else "")
+    target_models = _device_model_keys(crawl_name) or _device_model_keys(product.name if product else "")
+    target_tokens = _name_tokens(target_name) | target_models
     scored=[]
     for offer, source in offers:
         if offer.price == coupang_price: continue
         candidate_quantity = _package_quantity(offer.product_name)
         if target_quantity is not None and candidate_quantity is not None and target_quantity != candidate_quantity:
             continue
+        candidate_models = _device_model_keys(offer.product_name)
+        # A title that explicitly names a different phone model is not a product match,
+        # even if its generic terms or barcode happen to overlap.
+        if target_models and candidate_models and not (target_models & candidate_models):
+            continue
         if target_barcode and offer.barcode and target_barcode == offer.barcode:
             score=1.0; evidence="바코드 일치"
         else:
-            candidate_tokens=_name_tokens(offer.product_name)
+            candidate_tokens=_name_tokens(offer.product_name) | candidate_models
             overlap=target_tokens & candidate_tokens
-            score=(len(overlap)/len(target_tokens | candidate_tokens)) if target_tokens and candidate_tokens else 0.0
-            if score < 0.28: continue
-            evidence=f"상품명 단어 유사도 {round(score*100)}%"
+            score=(2*len(overlap)/(len(target_tokens)+len(candidate_tokens))) if target_tokens and candidate_tokens else 0.0
+            if score < 0.40: continue
+            evidence=f"상품명 단어 일치도 {round(score*100)}%"
         if target_quantity is not None and candidate_quantity == target_quantity:
             quantity_unit = {"piece":"개","set":"세트","pack":"팩"}[target_quantity[1]]
             evidence += f" · 구성 수량 {target_quantity[0]}{quantity_unit} 일치"
+        if target_models and candidate_models and target_models & candidate_models:
+            evidence += " · 기종 일치"
+        elif target_models and not candidate_models:
+            evidence += " · 후보 기종명 미표기, 확인 필요"
         candidate_url=offer.url
         if not candidate_url and ("스마트스토어" in source.lower() or "smartstore" in source.lower()):
             product_number=(offer.smartstore_product_id or "").strip()
